@@ -1,0 +1,4 @@
+
+# memory-api subproject
+/memory-api/node_modules
+/memory-api/.env
