@@ -21,3 +21,7 @@
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+
+# memory-api subproject
+/memory-api/node_modules
+/memory-api/.env

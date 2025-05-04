@@ -1,4 +1,5 @@
-// memory-api/server.js
+// backend/app.js
+
 require('dotenv').config();
 const express   = require('express');
 const cors      = require('cors');
@@ -11,43 +12,54 @@ app.use(cors());
 app.use(express.json());
 
 // ——————————————
-// Postgres
+// Configure Postgres pool
 // ——————————————
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  // ssl: { rejectUnauthorized: false } // if you need it in prod
+  // ssl: { rejectUnauthorized: false } // if needed on production
 });
 
 // ——————————————
-// Multer disk storage
+// Multer setup (disk storage)
 // ——————————————
 const upload = multer({
   storage: multer.diskStorage({
     destination: (req, file, cb) => {
-      cb(null, path.join(__dirname, 'uploads'));
+      cb(null, path.resolve(__dirname, 'uploads'));
     },
     filename: (req, file, cb) => {
-      const suffix = Date.now() + '-' + Math.round(Math.random()*1e9);
+      const uniqueSuffix = Date.now() + '-' + Math.round(Math.random()*1E9);
       const ext = path.extname(file.originalname);
-      cb(null, file.fieldname + '-' + suffix + ext);
+      cb(null, file.fieldname + '-' + uniqueSuffix + ext);
     }
   })
 });
 
-// serve uploaded files back
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+// ——————————————
+// Helper to “upload” file and return a URL
+// (swap out for S3 or Cloudinary as needed)
+// ——————————————
+async function uploadToS3(file) {
+  // for now, just return a local URL path:
+  return `/uploads/${file.filename}`;
+}
+
+// serve your uploads folder statically
+app.use('/uploads', express.static(path.resolve(__dirname, 'uploads')));
 
 // ——————————————
-// GET /prompts/random
+// 1) GET /prompts/random
+//    returns { prompt_id, prompt_text, category_color }
 // ——————————————
 app.get('/prompts/random', async (req, res) => {
   try {
     const { rows } = await pool.query(`
       SELECT p.prompt_id, p.prompt_text, c.marker_color AS category_color
-      FROM prompts_for_map p
-      JOIN categories_prompt c ON p.category_id = c.category_id
-      ORDER BY random()
-      LIMIT 1
+        FROM prompts_for_map p
+        JOIN categories_prompt c
+          ON p.category_id = c.category_id
+       ORDER BY random()
+       LIMIT 1
     `);
     if (!rows[0]) return res.status(404).json({ error: 'No prompts found' });
     res.json(rows[0]);
@@ -58,7 +70,8 @@ app.get('/prompts/random', async (req, res) => {
 });
 
 // ——————————————
-// GET /memories
+// 2) GET /memories
+//    returns a list of all memories joined with their prompt_text & category_color
 // ——————————————
 app.get('/memories', async (req, res) => {
   try {
@@ -68,8 +81,10 @@ app.get('/memories', async (req, res) => {
         p.prompt_text,
         c.marker_color AS category_color
       FROM map_your_memory m
-      LEFT JOIN prompts_for_map p  ON m.prompt_id = p.prompt_id
-      LEFT JOIN categories_prompt c ON p.category_id = c.category_id
+      LEFT JOIN prompts_for_map p
+        ON m.prompt_id = p.prompt_id
+      LEFT JOIN categories_prompt c
+        ON p.category_id = c.category_id
       ORDER BY m.memory_date DESC
     `);
     res.json(rows);
@@ -80,7 +95,8 @@ app.get('/memories', async (req, res) => {
 });
 
 // ——————————————
-// POST /memories  ← <— this one parses FormData + file
+// 3) POST /memories
+//    multipart/form-data: file + all fields
 // ——————————————
 app.post('/memories', upload.single('file'), async (req, res) => {
   try {
@@ -95,15 +111,16 @@ app.post('/memories', upload.single('file'), async (req, res) => {
       prompt_id = null
     } = req.body;
 
+    // your auth might set req.user.id — use that or stub:
     const user_id = req.user?.id || 'anonymous';
 
+    // 1) upload file
     if (!req.file) {
       return res.status(400).json({ error: 'Missing file' });
     }
-    // build a URL for your front-end to load:
-    const fileUrl = `/uploads/${req.file.filename}`;
+    const fileUrl = await uploadToS3(req.file);
 
-    // insert
+    // 2) insert into DB
     const insertSQL = `
       INSERT INTO map_your_memory
         (memory_name, file_url, description,
@@ -112,25 +129,34 @@ app.post('/memories', upload.single('file'), async (req, res) => {
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
       RETURNING memory_id
     `;
-    const values = [
-      memory_name, fileUrl, description,
-      memory_date, latitude||null, longitude||null,
-      user_id, place, visibility, prompt_id||null
+    const insertValues = [
+      memory_name,
+      fileUrl,
+      description,
+      memory_date,
+      latitude || null,
+      longitude || null,
+      user_id,
+      place,
+      visibility,
+      prompt_id || null
     ];
-    const { rows: ins } = await pool.query(insertSQL, values);
-    const newId = ins[0].memory_id;
+    const { rows: insertRows } = await pool.query(insertSQL, insertValues);
+    const newId = insertRows[0].memory_id;
 
-    // fetch the full row + joins:
+    // 3) fetch the full inserted record with joins
     const { rows } = await pool.query(`
       SELECT
         m.*,
         p.prompt_text,
         c.marker_color AS category_color
       FROM map_your_memory m
-      LEFT JOIN prompts_for_map p  ON m.prompt_id = p.prompt_id
-      LEFT JOIN categories_prompt c ON p.category_id = c.category_id
+      LEFT JOIN prompts_for_map p
+        ON m.prompt_id = p.prompt_id
+      LEFT JOIN categories_prompt c
+        ON p.category_id = c.category_id
       WHERE m.memory_id = $1
-    `, [ newId ]);
+    `, [newId]);
 
     res.json(rows[0]);
   } catch (err) {
@@ -140,7 +166,9 @@ app.post('/memories', upload.single('file'), async (req, res) => {
 });
 
 // ——————————————
-// start
+// start server
 // ——————————————
-const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`📡 API listening on port ${PORT}`));
+const PORT = process.env.PORT || 4000;
+app.listen(PORT, () => {
+  console.log(`API listening on http://localhost:${PORT}`);
+});
